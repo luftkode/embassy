@@ -28,7 +28,7 @@ impl<'a, PIO: Instance> PioOneWireProgram<'a, PIO> {
 
                 ; Tick rate is 1 tick per 6us, so all delays should be calculated back to that
                 ; All the instructions have a calculated delay XX in us as [(XX / CLK) - 1].
-                ; The - 1 is for the instruction which also takes one clock cyle.
+                ; The - 1 is for the instruction which also takes one clock cycle.
                 ; The delay can be 0 which will result in just 6us for the instruction itself
                 .define CLK 6
 
@@ -173,7 +173,7 @@ impl<'d, PIO: Instance, const SM: usize> PioOneWire<'d, PIO, SM> {
     pub async fn write_bytes(&mut self, data: &[u8]) {
         unsafe {
             self.sm.set_enable(false);
-            self.sm.set_y(u32::MAX as u32);
+            self.sm.set_y(u32::MAX);
             self.sm.set_enable(true);
         }
         let (rx, tx) = self.sm.rx_tx();
@@ -204,7 +204,7 @@ impl<'d, PIO: Instance, const SM: usize> PioOneWire<'d, PIO, SM> {
         embassy_time::Timer::after(pullup_time).await;
 
         // Signal that delay has completed
-        tx.wait_push(0 as u32).await;
+        tx.wait_push(0_u32).await;
         // Wait until it's back at 0 low, open drain
         let _ = rx.wait_pull().await;
     }
@@ -213,7 +213,7 @@ impl<'d, PIO: Instance, const SM: usize> PioOneWire<'d, PIO, SM> {
     pub async fn read_bytes(&mut self, data: &mut [u8]) {
         unsafe {
             self.sm.set_enable(false);
-            self.sm.set_y(u32::MAX as u32);
+            self.sm.set_y(u32::MAX);
             self.sm.set_enable(true);
         };
         let (rx, tx) = self.sm.rx_tx();
