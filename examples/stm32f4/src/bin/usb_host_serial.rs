@@ -6,8 +6,8 @@ use embassy_executor::Spawner;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usb::HostDriver;
 use embassy_stm32::{Config, bind_interrupts, peripherals, usb};
-use embassy_usb_host::UsbHost;
 use embassy_usb_host::class::cdc_acm::{CdcAcmHost, LineCoding};
+use embassy_usb_host::{BusRoute, UsbHost};
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
@@ -56,9 +56,9 @@ async fn main(_spawner: Spawner) {
 
         // Enumerate the device
         let mut config_buf = [0u8; 256];
-        let result = host.enumerate(speed, &mut config_buf).await;
+        let result = host.enumerate(BusRoute::Direct(speed), &mut config_buf).await;
 
-        let (dev_desc, addr, config_len) = match result {
+        let (enum_info, config_len) = match result {
             Ok(r) => r,
             Err(e) => {
                 error!("Enumeration failed: {:?}", e);
@@ -68,16 +68,11 @@ async fn main(_spawner: Spawner) {
 
         info!(
             "Enumerated: VID={:04x} PID={:04x} addr={}",
-            dev_desc.vendor_id, dev_desc.product_id, addr
+            enum_info.device_desc.vendor_id, enum_info.device_desc.product_id, enum_info.device_address
         );
 
         // Try to create a CDC ACM host driver
-        let mut cdc = match CdcAcmHost::new(
-            host.driver(),
-            &config_buf[..config_len],
-            addr,
-            dev_desc.max_packet_size0 as u16,
-        ) {
+        let mut cdc = match CdcAcmHost::new(host.driver(), &config_buf[..config_len], &enum_info) {
             Ok(c) => c,
             Err(e) => {
                 error!("CDC ACM init failed: {:?}", e);

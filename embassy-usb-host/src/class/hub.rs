@@ -2,27 +2,30 @@
 #![allow(missing_docs)]
 //!
 //! Handles the deferred bus reset and port state/speed detection required for hub enumeration.
-//! Requires the USB driver to support Interrupt IN channels.
+//! Requires the USB driver to support Interrupt IN pipes.
 
 use core::num::NonZeroU8;
 
 use bitflags::bitflags;
 use embassy_time::Timer;
-use embassy_usb_driver::host::{HostError, RequestType, SetupPacket, UsbChannel, UsbHostDriver, channel};
+use embassy_usb::control::Request;
+use embassy_usb_driver::host::{HostError, SplitInfo, SplitSpeed, UsbHostDriver, UsbPipe, pipe};
 use embassy_usb_driver::{Direction, EndpointInfo, EndpointType, Speed};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, KnownLayout};
 
-use crate::control::{CLEAR_FEATURE, ControlChannelExt, GET_STATUS, SET_FEATURE};
+use crate::control::{ControlPipeExt, ControlType, Recipient, RequestType, SetupPacket};
 use crate::descriptor::{DEFAULT_MAX_DESCRIPTOR_SIZE, InterfaceDescriptor, USBDescriptor};
-use crate::handler::{EnumerationInfo, HandlerEvent, RegisterError};
+use crate::handler::{BusRoute, EnumerationInfo, HandlerEvent, RegisterError};
+use crate::{EnumerationError, UsbHost};
 
-pub struct HubHandler<H: UsbHostDriver, const MAX_PORTS: usize> {
-    interrupt_channel: H::Channel<channel::Interrupt, channel::In>,
-    control_channel: H::Channel<channel::Control, channel::InOut>,
+pub struct HubHandler<'d, H: UsbHostDriver<'d>, const MAX_PORTS: usize> {
+    interrupt_channel: H::Pipe<pipe::Interrupt, pipe::In>,
+    control_channel: H::Pipe<pipe::Control, pipe::InOut>,
     desc: HubDescriptor,
     device_address: u8,
     device_lut: [Option<NonZeroU8>; MAX_PORTS],
-    speed: Speed,
+    route: BusRoute,
+    _phantom: core::marker::PhantomData<&'d ()>,
 }
 
 #[derive(Debug)]
@@ -32,10 +35,11 @@ pub enum HubEvent {
     DeviceRemoved { address: Option<NonZeroU8>, port: u8 },
 }
 
-impl<H: UsbHostDriver, const MAX_PORTS: usize> HubHandler<H, MAX_PORTS> {
+impl<'d, H: UsbHostDriver<'d>, const MAX_PORTS: usize> HubHandler<'d, H, MAX_PORTS> {
     /// Attempt to register a hub handler for the given device.
     pub async fn try_register(bus: &H, enum_info: &EnumerationInfo) -> Result<Self, RegisterError> {
-        let mut control_channel = bus.alloc_channel::<channel::Control, channel::InOut>(
+        let ls_over_fs = matches!(enum_info.split(), Some(s) if s.device_speed() == SplitSpeed::Low);
+        let mut control_channel = bus.alloc_pipe::<pipe::Control, pipe::InOut>(
             enum_info.device_address,
             &EndpointInfo {
                 addr: 0.into(),
@@ -43,10 +47,10 @@ impl<H: UsbHostDriver, const MAX_PORTS: usize> HubHandler<H, MAX_PORTS> {
                 max_packet_size: enum_info
                     .device_desc
                     .max_packet_size0
-                    .min(if enum_info.ls_over_fs { 8 } else { 64 }) as u16,
+                    .min(if ls_over_fs { 8 } else { 64 }) as u16,
                 interval_ms: 0,
             },
-            enum_info.ls_over_fs,
+            enum_info.split(),
         )?;
 
         let mut cfg_desc_buf = [0u8; DEFAULT_MAX_DESCRIPTOR_SIZE];
@@ -74,10 +78,10 @@ impl<H: UsbHostDriver, const MAX_PORTS: usize> HubHandler<H, MAX_PORTS> {
             .find(|v| v.ep_type() == EndpointType::Interrupt && v.ep_dir() == Direction::In)
             .ok_or(RegisterError::NoSupportedInterface)?;
 
-        let interrupt_channel = bus.alloc_channel::<channel::Interrupt, channel::In>(
+        let interrupt_channel = bus.alloc_pipe::<pipe::Interrupt, pipe::In>(
             enum_info.device_address,
             &interrupt_ep.into(),
-            enum_info.ls_over_fs,
+            enum_info.split(),
         )?;
 
         let desc = control_channel.request_descriptor::<HubDescriptor, 64>(0, true).await?;
@@ -88,7 +92,8 @@ impl<H: UsbHostDriver, const MAX_PORTS: usize> HubHandler<H, MAX_PORTS> {
             desc,
             device_address: enum_info.device_address,
             device_lut: [None; MAX_PORTS],
-            speed: enum_info.speed,
+            route: enum_info.route,
+            _phantom: core::marker::PhantomData,
         };
 
         for port in 0..hub.desc.port_num {
@@ -102,7 +107,8 @@ impl<H: UsbHostDriver, const MAX_PORTS: usize> HubHandler<H, MAX_PORTS> {
     /// Wait for a hub port status change event.
     pub async fn wait_for_event(&mut self) -> Result<HandlerEvent<HubEvent>, HostError> {
         loop {
-            let mut buf = [0u8; 16];
+            // 1 hub + maximum of 255 ports (USB 2.0 Spec 11.12.3 and 11.23.2.1)
+            let mut buf = [0u8; (1 + 255) / u8::BITS as usize];
             let slice = &mut buf[..(self.desc.port_num as usize / 8) + 1];
             self.interrupt_channel.request_in(slice).await?;
 
@@ -167,74 +173,152 @@ impl<H: UsbHostDriver, const MAX_PORTS: usize> HubHandler<H, MAX_PORTS> {
     #[allow(dead_code)]
     async fn hub_feature(&mut self, set: bool, feature: HubFeature) -> Result<(), HostError> {
         let setup = SetupPacket {
-            request_type: RequestType::OUT | RequestType::TYPE_CLASS | RequestType::RECIPIENT_DEVICE,
-            request: if set { SET_FEATURE } else { CLEAR_FEATURE },
+            request_type: RequestType {
+                direction: Direction::Out,
+                control_type: ControlType::Class,
+                recipient: Recipient::Device,
+            },
+            request: if set {
+                Request::SET_FEATURE
+            } else {
+                Request::CLEAR_FEATURE
+            },
             value: feature as u16,
             index: 0,
             length: 0,
         };
-        self.control_channel.control_out(&setup, &[]).await?;
+        self.control_channel.control_out(&setup.to_bytes(), &[]).await?;
         Ok(())
     }
 
     async fn get_hub_status(&mut self) -> Result<(HubStatus, HubStatusChange), HostError> {
         let setup = SetupPacket {
-            request_type: RequestType::IN | RequestType::TYPE_CLASS | RequestType::RECIPIENT_DEVICE,
-            request: GET_STATUS,
+            request_type: RequestType {
+                direction: Direction::In,
+                control_type: ControlType::Class,
+                recipient: Recipient::Device,
+            },
+            request: Request::GET_STATUS,
             value: 0,
             index: 0,
             length: 4,
         };
-        let mut buf = [0u16; 2];
-        self.control_channel.control_in(&setup, buf.as_mut_bytes()).await?;
+        let mut buf = [0u8; 4];
+        self.control_channel.control_in(&setup.to_bytes(), &mut buf).await?;
         Ok((
-            HubStatus::from_bits_truncate(buf[0]),
-            HubStatusChange::from_bits_truncate(buf[1]),
+            HubStatus::from_bits_truncate(u16::from_le_bytes(buf[..2].try_into().unwrap())),
+            HubStatusChange::from_bits_truncate(u16::from_le_bytes(buf[2..].try_into().unwrap())),
         ))
     }
 
     /// Reset a port and enumerate the device attached to it.
+    ///
+    /// `port` and `speed` are the 0-based port index and device speed as
+    /// reported by [`HubEvent::DeviceDetected`]. `bus` is the USB host to
+    /// use for enumeration, and it must be the same bus that this hub is
+    /// registered on.
+    ///
+    /// Returns the [`EnumerationInfo`] for the device and bytes written
+    /// to `config_buffer`.
+    ///
+    /// The route included in the [`EnumerationInfo`] is computed per
+    /// USB 2.0 §11.14:
+    ///
+    /// - If this hub is itself reached through a split transaction (e.g. a
+    ///   full-speed hub behind a high-speed hub's Transaction Translator),
+    ///   the child inherits the parent's TT address and port, with the
+    ///   `device_speed` updated to match the attached device. This is
+    ///   correct because the topmost high-speed hub in the chain owns the TT
+    ///   that services the entire subtree below it.
+    /// - Otherwise, if this hub introduces a speed mismatch with the child
+    ///   (HS hub with an LS/FS child, or FS hub with an LS child, where the
+    ///   latter uses the legacy `PRE` prefix on full-speed buses), a new
+    ///   [`SplitInfo`] is constructed pointing at this hub.
+    /// - Otherwise the child is reached directly at its native speed.
     pub async fn enumerate_port(
         &mut self,
+        bus: &mut UsbHost<'d, H>,
+        config_buffer: &mut [u8],
         port: u8,
         speed: Speed,
-        new_device_address: u8,
-    ) -> Result<EnumerationInfo, HostError> {
+    ) -> Result<(EnumerationInfo, usize), EnumerationError> {
         self.port_feature(true, PortFeature::Reset, port, 0).await?;
+        // USB 2.0 §7.1.7.5: TDRSTR ≥ 10 ms. Match the 50 ms margin used in similar drivers.
         Timer::after_millis(50).await;
         self.port_feature(false, PortFeature::ChangeReset, port, 0).await?;
 
-        let ls_pre = matches!((speed, self.speed), (Speed::Low, Speed::Full | Speed::High));
-        self.control_channel
-            .enumerate_device(speed, new_device_address, ls_pre)
-            .await
+        let route = match self.route.split() {
+            Some(parent_split) => match speed {
+                Speed::Low => BusRoute::Translated(SplitInfo::new(
+                    parent_split.hub_addr(),
+                    parent_split.port(),
+                    SplitSpeed::Low,
+                )),
+                Speed::Full => BusRoute::Translated(SplitInfo::new(
+                    parent_split.hub_addr(),
+                    parent_split.port(),
+                    SplitSpeed::Full,
+                )),
+                Speed::High => BusRoute::Direct(speed),
+            },
+            None => {
+                let split_speed = match (speed, self.route.device_speed()) {
+                    (Speed::Low, Speed::Full | Speed::High) => Some(SplitSpeed::Low),
+                    (Speed::Full, Speed::High) => Some(SplitSpeed::Full),
+                    _ => None,
+                };
+                match split_speed {
+                    Some(ss) => BusRoute::Translated(SplitInfo::new(self.device_address, port + 1, ss)),
+                    None => BusRoute::Direct(speed),
+                }
+            }
+        };
+
+        let (info, config_len) = bus.enumerate(route, config_buffer).await?;
+
+        // Store the device address in the LUT for later retrieval on disconnect.
+        self.device_lut[port as usize] = NonZeroU8::new(info.device_address);
+
+        Ok((info, config_len))
     }
 
     async fn port_feature(&mut self, set: bool, feature: PortFeature, port: u8, selector: u8) -> Result<(), HostError> {
         let setup = SetupPacket {
-            request_type: RequestType::OUT | RequestType::TYPE_CLASS | RequestType::RECIPIENT_OTHER,
-            request: if set { SET_FEATURE } else { CLEAR_FEATURE },
+            request_type: RequestType {
+                direction: Direction::Out,
+                control_type: ControlType::Class,
+                recipient: Recipient::Other,
+            },
+            request: if set {
+                Request::SET_FEATURE
+            } else {
+                Request::CLEAR_FEATURE
+            },
             value: feature as u16,
             index: ((selector as u16) << 8) | (port + 1) as u16,
             length: 0,
         };
-        self.control_channel.control_out(&setup, &[]).await?;
+        self.control_channel.control_out(&setup.to_bytes(), &[]).await?;
         Ok(())
     }
 
     async fn get_port_status(&mut self, port: u8) -> Result<(PortStatus, PortStatusChange), HostError> {
         let setup = SetupPacket {
-            request_type: RequestType::IN | RequestType::TYPE_CLASS | RequestType::RECIPIENT_OTHER,
-            request: GET_STATUS,
+            request_type: RequestType {
+                direction: Direction::In,
+                control_type: ControlType::Class,
+                recipient: Recipient::Other,
+            },
+            request: Request::GET_STATUS,
             value: 0,
             index: (port + 1) as u16,
             length: 4,
         };
-        let mut buf = [0u16; 2];
-        self.control_channel.control_in(&setup, buf.as_mut_bytes()).await?;
+        let mut buf = [0u8; 4];
+        self.control_channel.control_in(&setup.to_bytes(), &mut buf).await?;
         Ok((
-            PortStatus::from_bits_truncate(buf[0]),
-            PortStatusChange::from_bits_truncate(buf[1]),
+            PortStatus::from_bits_truncate(u16::from_le_bytes(buf[..2].try_into().unwrap())),
+            PortStatusChange::from_bits_truncate(u16::from_le_bytes(buf[2..].try_into().unwrap())),
         ))
     }
 }
