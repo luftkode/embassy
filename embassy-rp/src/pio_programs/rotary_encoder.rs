@@ -36,11 +36,16 @@ impl<'d, T: Instance, const SM: usize> PioEncoder<'d, T, SM> {
         pin_a: Peri<'d, impl PioPin>,
         pin_b: Peri<'d, impl PioPin>,
         program: &PioEncoderProgram<'d, T>,
+        config: EncoderConfig,
     ) -> Self {
         let mut pin_a = pio.make_pio_pin(pin_a);
         let mut pin_b = pio.make_pio_pin(pin_b);
-        pin_a.set_pull(Pull::Up);
-        pin_b.set_pull(Pull::Up);
+
+        pin_a.set_pull(config.pull);
+        pin_b.set_pull(config.pull);
+        pin_a.set_schmitt(config.schmitt);
+        pin_b.set_schmitt(config.schmitt);
+
         sm.set_pin_dirs(PioDirection::In, &[&pin_a, &pin_b]);
 
         let mut cfg = Config::default();
@@ -75,4 +80,40 @@ pub enum Direction {
     Clockwise,
     /// Encoder turned counter clockwise
     CounterClockwise,
+}
+
+/// Configuration of encoder input pins
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct EncoderConfig {
+    pull: Pull,
+    schmitt: bool,
+}
+
+impl EncoderConfig {
+    /// Create a new `EncoderConfig` with the specified pull and trigger modes
+    pub fn new(pull: Pull, schmitt_trigger: bool) -> Self {
+        Self {
+            pull,
+            schmitt: schmitt_trigger,
+        }
+    }
+
+    /// Pin pull mode
+    pub fn pull(&self) -> Pull {
+        self.pull
+    }
+
+    /// Schmitt trigger mode
+    pub fn schmitt(&self) -> bool {
+        self.schmitt
+    }
+}
+
+impl Default for EncoderConfig {
+    fn default() -> Self {
+        Self {
+            pull: Pull::Up,
+            schmitt: false,
+        }
+    }
 }
